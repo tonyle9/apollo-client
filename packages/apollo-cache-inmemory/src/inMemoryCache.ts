@@ -16,7 +16,8 @@ import {
 } from './types';
 import { writeResultToStore } from './writeToStore';
 import { readQueryFromStore, diffQueryAgainstStore } from './readFromStore';
-import { defaultNormalizedCacheFactory } from './depTrackingCache';
+import { wrap, defaultMakeCacheKey } from "./optimism";
+import { defaultNormalizedCacheFactory, DepTrackingCache } from './depTrackingCache';
 import { record } from './recordingCache';
 const defaultConfig: ApolloReducerConfig = {
   fragmentMatcher: new HeuristicFragmentMatcher(),
@@ -40,7 +41,7 @@ export class InMemoryCache extends ApolloCache<NormalizedCacheObject> {
   protected data: NormalizedCache;
   protected config: ApolloReducerConfig;
   protected optimistic: OptimisticStoreItem[] = [];
-  private watches: Cache.WatchOptions[] = [];
+  private watches = new Set<Cache.WatchOptions>();
   private addTypename: boolean;
 
   // Set this while in a transaction to prevent broadcasts...
@@ -135,10 +136,10 @@ export class InMemoryCache extends ApolloCache<NormalizedCacheObject> {
   }
 
   public watch(watch: Cache.WatchOptions): () => void {
-    this.watches.push(watch);
+    this.watches.add(watch);
 
     return () => {
-      this.watches = this.watches.filter(c => c !== watch);
+      this.watches.delete(watch);
     };
   }
 
@@ -260,23 +261,42 @@ export class InMemoryCache extends ApolloCache<NormalizedCacheObject> {
     });
   }
 
+  public hasDepTrackingCache() {
+    return this.data instanceof DepTrackingCache;
+  }
+
   protected broadcastWatches() {
     // Skip this when silenced (like inside a transaction)
     if (this.silenceBroadcast) return;
 
     // right now, we invalidate all queries whenever anything changes
     this.watches.forEach((c: Cache.WatchOptions) => {
-      const newData = this.diff({
-        query: c.query,
-        variables: c.variables,
-
-        // TODO: previousResult isn't in the types - this will only work
-        // with ObservableQuery which is in a different package
-        previousResult: (c as any).previousResult && c.previousResult(),
-        optimistic: c.optimistic,
-      });
-
-      c.callback(newData);
+      maybeBroadcastWatch(this, c);
     });
   }
 }
+
+const maybeBroadcastWatch = wrap(function (
+  cache: InMemoryCache,
+  c: Cache.WatchOptions,
+): void {
+  c.callback(cache.diff({
+    query: c.query,
+    variables: c.variables,
+    optimistic: c.optimistic,
+  }));
+}, {
+  makeCacheKey(
+    cache: InMemoryCache,
+    c: Cache.WatchOptions,
+  ) {
+    if (cache.hasDepTrackingCache()) {
+      return defaultMakeCacheKey(
+        cache,
+        c.query,
+        c.optimistic,
+        JSON.stringify(c.variables),
+      );
+    }
+  }
+});
